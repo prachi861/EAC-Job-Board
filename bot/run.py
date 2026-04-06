@@ -101,6 +101,17 @@ def run():
     filtered = [j for j in raw if is_sponsored(j.get("company", ""), j.get("description", ""))]
     log.info(f"After visa filter: {len(filtered)}")
 
+    # Keep only US-based or Remote roles
+    us_terms = {"us", "usa", "united states", "remote", "new york", "san francisco",
+                "seattle", "austin", "boston", "chicago", "los angeles", "denver",
+                "atlanta", "miami", "washington", "nyc", "sf", "bay area"}
+    filtered = [
+        j for j in filtered
+        if any(term in j.get("location", "").lower() for term in us_terms)
+        or not j.get("location")  # include if location is blank
+    ]
+    log.info(f"After US filter: {len(filtered)}")
+
     new_jobs = filter_new(filtered)
     log.info(f"New this week: {len(new_jobs)}")
 
