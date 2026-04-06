@@ -7,11 +7,6 @@ log = logging.getLogger(__name__)
 
 WEBHOOK_URL = os.environ["SLACK_WEBHOOK_URL"]
 
-SOURCE_EMOJI = {
-    "YC": "🚀", "Wellfound": "🌐", "Greenhouse": "🌿",
-    "Lever": "⚙️", "LinkedIn": "💼", "Orbiter": "🛸",
-}
-
 
 def _header_block(total: int) -> dict:
     date = datetime.now().strftime("%B %d, %Y")
@@ -20,26 +15,34 @@ def _header_block(total: int) -> dict:
         "text": {
             "type": "mrkdwn",
             "text": (
-                f"👋 *Happy Monday — O1-Friendly Job Drop | {date}*\n"
-                f"_{total} new visa-sponsoring roles this week._\n"
-                f"{'━' * 40}"
+                f"*O1-Friendly Job Board — {date}*\n"
+                f"_{total} curated roles from companies that sponsor visas._"
             ),
         },
     }
 
 
 def _job_block(job: dict) -> dict:
-    emoji = SOURCE_EMOJI.get(job.get("source", ""), "📌")
     url = job.get("url", "")
-    link = f"<{url}|View Listing>" if url else "No link"
+    location = job.get("location", "Remote")
+    industry = job.get("industry", "")
+    posted = job.get("posted_at")
+    posted_str = posted.strftime("%b %d") if posted else ""
+
+    meta_parts = [location]
+    if industry:
+        meta_parts.append(industry)
+    if posted_str:
+        meta_parts.append(f"Posted {posted_str}")
+    meta = "  ·  ".join(meta_parts)
+
+    link = f"<{url}|{job['title']}>" if url else job["title"]
+
     return {
         "type": "section",
         "text": {
             "type": "mrkdwn",
-            "text": (
-                f"{emoji} *{job['title']}* — {job['company']}\n"
-                f"📍 {job.get('location', 'Remote')}  ·  🔗 {link}  ·  `{job.get('source', '')}`"
-            ),
+            "text": f"*{link}*\n{job['company']}  —  {meta}",
         },
     }
 
@@ -47,17 +50,22 @@ def _job_block(job: dict) -> dict:
 def _footer_block(total: int) -> dict:
     shown = min(total, 20)
     return {
-        "type": "section",
-        "text": {
-            "type": "mrkdwn",
-            "text": f"_Showing {shown} of {total} listings. Know a role we missed? Drop it in the thread 🧵_",
-        },
+        "type": "context",
+        "elements": [
+            {
+                "type": "mrkdwn",
+                "text": f"Showing {shown} of {total} roles · Know a listing we missed? Drop it in the thread.",
+            }
+        ],
     }
 
 
 def post_digest(jobs: list):
     capped = jobs[:20]
-    blocks = [_header_block(len(jobs))]
+    blocks = [
+        _header_block(len(jobs)),
+        {"type": "divider"},
+    ]
     for job in capped:
         blocks.append(_job_block(job))
         blocks.append({"type": "divider"})
