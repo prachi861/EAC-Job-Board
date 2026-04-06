@@ -2,6 +2,7 @@
 
 import logging
 import requests
+from datetime import datetime, timezone
 
 log = logging.getLogger(__name__)
 
@@ -21,6 +22,14 @@ def scrape_yc() -> list[dict]:
         )
         r.raise_for_status()
         for job in r.json().get("jobs", []):
+            created = job.get("created_at")
+            posted = None
+            if created:
+                try:
+                    posted = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                except Exception:
+                    pass
+
             jobs.append({
                 "title": job.get("title", ""),
                 "company": job.get("company", {}).get("name", ""),
@@ -28,6 +37,7 @@ def scrape_yc() -> list[dict]:
                 "description": job.get("description", ""),
                 "url": f"https://www.workatastartup.com/jobs/{job.get('id')}",
                 "source": "YC",
+                "posted_at": posted,
             })
     except Exception as e:
         log.error(f"YC scraper failed: {e}")
