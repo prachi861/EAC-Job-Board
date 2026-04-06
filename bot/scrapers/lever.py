@@ -3,6 +3,7 @@
 import time
 import logging
 import requests
+from datetime import datetime, timezone
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +30,16 @@ def scrape_lever() -> list[dict]:
             r.raise_for_status()
             for job in r.json():
                 desc = job.get("descriptionPlain", "") + " " + job.get("additionalPlain", "")
+
+                # Lever returns createdAt as Unix timestamp in ms
+                created_at = job.get("createdAt")
+                posted = None
+                if created_at:
+                    try:
+                        posted = datetime.fromtimestamp(created_at / 1000, tz=timezone.utc)
+                    except Exception:
+                        pass
+
                 jobs.append({
                     "title": job.get("text", ""),
                     "company": slug.replace("-", " ").title(),
@@ -36,6 +47,7 @@ def scrape_lever() -> list[dict]:
                     "description": desc,
                     "url": job.get("hostedUrl", ""),
                     "source": "Lever",
+                    "posted_at": posted,
                 })
         except Exception as e:
             log.warning(f"Lever {slug} failed: {e}")
