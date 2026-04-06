@@ -1,0 +1,44 @@
+name: O1 Weekly Job Digest
+
+
+on:
+  schedule:
+    - cron: '0 14 * * 1'   # Every Monday at 9am ET (14:00 UTC)
+  workflow_dispatch:         # Allow manual trigger from GitHub UI
+
+jobs:
+  scrape-and-post:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Restore dedup cache
+        uses: actions/cache@v4
+        with:
+          path: data/seen_jobs.json
+          key: seen-jobs-${{ github.run_id }}
+          restore-keys: seen-jobs-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: Run scraper
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: python -m bot.run
+
+      - name: Save dedup cache
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: data/seen_jobs.json
+          key: seen-jobs-${{ github.run_id }}
