@@ -1,23 +1,25 @@
-"""Cross-week deduplication — tracks posted jobs in data/seen_jobs.json."
-
 import json
 from pathlib import Path
 
 SEEN_PATH = Path("data/seen_jobs.json")
 
-def _load() -> set[str]:
+
+def _load() -> set:
     if SEEN_PATH.exists():
         return set(json.loads(SEEN_PATH.read_text()))
     return set()
 
+
 def _key(job: dict) -> str:
     return f"{job.get('title','').lower()}||{job.get('company','').lower()}"
 
-def filter_new(jobs: list[dict]) -> list[dict]:
+
+def filter_new(jobs: list) -> list:
     seen = _load()
     return [j for j in jobs if _key(j) not in seen]
 
-def mark_seen(jobs: list[dict]):
+
+def mark_seen(jobs: list):
     seen = _load()
     for j in jobs:
         seen.add(_key(j))
