@@ -3,6 +3,7 @@
 import time
 import logging
 import requests
+from datetime import datetime, timezone
 
 log = logging.getLogger(__name__)
 
@@ -29,6 +30,15 @@ def scrape_greenhouse() -> list[dict]:
             )
             r.raise_for_status()
             for job in r.json().get("jobs", []):
+                # Greenhouse returns updated_at as a Unix timestamp in ms
+                updated_at = job.get("updated_at")
+                posted = None
+                if updated_at:
+                    try:
+                        posted = datetime.fromtimestamp(updated_at / 1000, tz=timezone.utc)
+                    except Exception:
+                        pass
+
                 jobs.append({
                     "title": job.get("title", ""),
                     "company": slug.replace("-", " ").title(),
@@ -36,6 +46,7 @@ def scrape_greenhouse() -> list[dict]:
                     "description": job.get("content", ""),
                     "url": job.get("absolute_url", ""),
                     "source": "Greenhouse",
+                    "posted_at": posted,
                 })
         except Exception as e:
             log.warning(f"Greenhouse {slug} failed: {e}")
