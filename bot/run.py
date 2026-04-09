@@ -122,7 +122,7 @@ def diversify(jobs: list, target: int = 15) -> list:
     other    = sorted([j for j in jobs if j.get("industry") == "Other"],    key=sort_key)
     jobs = priority + other
 
-    seen_companies = set()
+    seen_companies = {}
     industry_counts = {k: 0 for k in INDUSTRY_KEYWORDS}
     industry_counts["Other"] = 0
     selected = []
@@ -131,12 +131,12 @@ def diversify(jobs: list, target: int = 15) -> list:
         company  = job.get("company", "").lower().strip()
         industry = job.get("industry", "Other")
 
-        if company and company in seen_companies:
+        if company and seen_companies.get(company, 0) >= 2:
             continue
-        if industry_counts.get(industry, 0) >= 2:
+        if industry_counts.get(industry, 0) >= 3:
             continue
 
-        seen_companies.add(company)
+        seen_companies[company] = seen_companies.get(company, 0) + 1
         industry_counts[industry] = industry_counts.get(industry, 0) + 1
         selected.append(job)
 
