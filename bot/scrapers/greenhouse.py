@@ -8,32 +8,46 @@ from datetime import datetime
 log = logging.getLogger(__name__)
 HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
 
-GREENHOUSE_SLUGS = [
+# slug → display name (only verified working slugs)
+GREENHOUSE_COMPANIES = {
     # AI/ML
-    "anthropic", "openai", "cohereai", "databricks", "scaleai",
-    "anyscale", "perplexityai", "adept",
+    "anthropic":        "Anthropic",
+    "databricks":       "Databricks",
+    "scale":            "Scale AI",
+    "cohere":           "Cohere",
     # SWE / Infra
-    "stripe", "vercel", "hashicorp", "datadoghq", "confluent",
-    "airbyte", "figma",
+    "stripe":           "Stripe",
+    "figma":            "Figma",
+    "datadog":          "Datadog",
+    "confluent":        "Confluent",
+    "vercel":           "Vercel",
     # Data
-    "fivetran", "hightouch",
+    "fivetran":         "Fivetran",
     # Fintech
-    "brex", "plaid", "coinbase", "robinhood", "ramp", "mercury",
+    "brex":             "Brex",
+    "coinbase":         "Coinbase",
+    "robinhood":        "Robinhood",
+    "mercury":          "Mercury",
+    "ramp":             "Ramp",
     # Design / Product
-    "miro", "loom", "airtable",
-    # Science / Hardware
-    "nvidiacareers", "benchling", "recursion", "tempus",
+    "airtable":         "Airtable",
+    "miro":             "Miro",
     # Consumer
-    "airbnb", "doordash", "instacart", "reddit",
-    # Renewable / EV
-    "formenergy", "samsara", "lucidmotors",
-]
+    "airbnb":           "Airbnb",
+    "doordash":         "DoorDash",
+    "instacart":        "Instacart",
+    "reddit":           "Reddit",
+    # Hardware / Science
+    "nvidia":           "NVIDIA",
+    "samsara":          "Samsara",
+    "lucidmotors":      "Lucid Motors",
+}
 
 
 def scrape_greenhouse() -> list[dict]:
     log.info("Scraping Greenhouse…")
     jobs = []
-    for slug in GREENHOUSE_SLUGS:
+    for slug, company_name in GREENHOUSE_COMPANIES.items():
         try:
             r = requests.get(
                 f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true",
@@ -48,7 +62,6 @@ def scrape_greenhouse() -> list[dict]:
                         posted = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
                     except Exception:
                         pass
-                company_name = slug.replace("-", " ").title()
                 jobs.append({
                     "title":       job.get("title", ""),
                     "company":     company_name,
