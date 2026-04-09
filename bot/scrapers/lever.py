@@ -8,27 +8,41 @@ from datetime import datetime, timezone
 log = logging.getLogger(__name__)
 HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
 
-LEVER_SLUGS = [
+# slug → display name (only verified working slugs)
+LEVER_COMPANIES = {
     # AI / ML
-    "togetherai", "mistral", "characterai", "inflection",
+    "together":         "Together AI",
+    "mistral":          "Mistral",
+    "cohere":           "Cohere",
     # SWE / Infra
-    "figma", "linearapp", "retool", "rippling", "brex", "notion",
-    "scaleai", "anyscale", "vercel",
+    "linear":           "Linear",
+    "notion":           "Notion",
+    "rippling":         "Rippling",
+    "retool":           "Retool",
+    "anyscale":         "Anyscale",
     # Data
-    "dbtlabs", "prefecthq",
+    "dbt-labs":         "dbt Labs",
+    "prefect":          "Prefect",
+    "hightouch":        "Hightouch",
     # Fintech
-    "carta", "deel", "mercury", "ramp",
+    "brex":             "Brex",
+    "carta":            "Carta",
+    "deel":             "Deel",
+    "ramp":             "Ramp",
     # Design
-    "miro", "airtable",
+    "figma":            "Figma",
+    "miro":             "Miro",
+    "airtable":         "Airtable",
     # Renewable / Hardware
-    "formenergy", "samsara",
-]
+    "samsara":          "Samsara",
+    "formenergy":       "Form Energy",
+}
 
 
 def scrape_lever() -> list[dict]:
     log.info("Scraping Lever…")
     jobs = []
-    for slug in LEVER_SLUGS:
+    for slug, company_name in LEVER_COMPANIES.items():
         try:
             r = requests.get(
                 f"https://api.lever.co/v0/postings/{slug}?mode=json",
@@ -46,7 +60,7 @@ def scrape_lever() -> list[dict]:
                 desc = job.get("descriptionPlain", "") + " " + job.get("additionalPlain", "")
                 jobs.append({
                     "title":       job.get("text", ""),
-                    "company":     job.get("company", slug.replace("-", " ").title()),
+                    "company":     company_name,
                     "location":    job.get("categories", {}).get("location", "Remote"),
                     "description": desc.strip(),
                     "url":         job.get("hostedUrl", ""),
