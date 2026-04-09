@@ -3,53 +3,64 @@
 import time
 import logging
 import requests
-from datetime import datetime, timezone
+from datetime import datetime
 
 log = logging.getLogger(__name__)
+HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-}
-
-COMPANY_SLUGS = [
-    "openai", "anthropic", "stripe", "notion", "linear", "figma",
-    "brex", "rippling", "retool", "scale", "cohere", "databricks",
-    "nvidia", "palantir", "coinbase", "robinhood", "plaid", "airbnb",
+GREENHOUSE_SLUGS = [
+    # AI/ML
+    "anthropic", "openai", "cohereai", "databricks", "scaleai",
+    "anyscale", "perplexityai", "adept",
+    # SWE / Infra
+    "stripe", "vercel", "hashicorp", "datadoghq", "confluent",
+    "airbyte", "figma",
+    # Data
+    "fivetran", "hightouch",
+    # Fintech
+    "brex", "plaid", "coinbase", "robinhood", "ramp", "mercury",
+    # Design / Product
+    "miro", "loom", "airtable",
+    # Science / Hardware
+    "nvidiacareers", "benchling", "recursion", "tempus",
+    # Consumer
+    "airbnb", "doordash", "instacart", "reddit",
+    # Renewable / EV
+    "formenergy", "samsara", "lucidmotors",
 ]
 
 
 def scrape_greenhouse() -> list[dict]:
     log.info("Scraping Greenhouse…")
     jobs = []
-    for slug in COMPANY_SLUGS:
+    for slug in GREENHOUSE_SLUGS:
         try:
             r = requests.get(
                 f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true",
-                headers=HEADERS,
-                timeout=15,
+                headers=HEADERS, timeout=15,
             )
             r.raise_for_status()
             for job in r.json().get("jobs", []):
-                # Greenhouse returns updated_at as a Unix timestamp in ms
-                updated_at = job.get("updated_at")
                 posted = None
+                updated_at = job.get("updated_at")
                 if updated_at:
                     try:
-                        posted = datetime.fromtimestamp(updated_at / 1000, tz=timezone.utc)
+                        posted = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
                     except Exception:
                         pass
-
+                dept = job.get("departments", [])
+                company_name = dept[0].get("name", slug.title()) if dept else slug.title()
                 jobs.append({
-                    "title": job.get("title", ""),
-                    "company": slug.replace("-", " ").title(),
-                    "location": job.get("location", {}).get("name", "Remote"),
+                    "title":       job.get("title", ""),
+                    "company":     company_name,
+                    "location":    job.get("location", {}).get("name", "Remote"),
                     "description": job.get("content", ""),
-                    "url": job.get("absolute_url", ""),
-                    "source": "Greenhouse",
-                    "posted_at": posted,
+                    "url":         job.get("absolute_url", ""),
+                    "source":      "Greenhouse",
+                    "posted_at":   posted,
                 })
         except Exception as e:
             log.warning(f"Greenhouse {slug} failed: {e}")
-        time.sleep(0.5)
+        time.sleep(0.3)
     log.info(f"Greenhouse → {len(jobs)} jobs")
     return jobs
