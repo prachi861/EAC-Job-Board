@@ -40,7 +40,7 @@ def scrape_greenhouse() -> list[dict]:
                 headers=HEADERS, timeout=15,
             )
             r.raise_for_status()
-            for job in r.json().get("jobs", []):
+            for job in r.json().get("jobs", [])[:50]:
                 posted = None
                 updated_at = job.get("updated_at")
                 if updated_at:
@@ -48,8 +48,7 @@ def scrape_greenhouse() -> list[dict]:
                         posted = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
                     except Exception:
                         pass
-                dept = job.get("departments", [])
-                company_name = dept[0].get("name", slug.title()) if dept else slug.title()
+                company_name = slug.replace("-", " ").title()
                 jobs.append({
                     "title":       job.get("title", ""),
                     "company":     company_name,
