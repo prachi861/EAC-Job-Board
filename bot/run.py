@@ -4,12 +4,9 @@ Selects up to 15 diverse roles across unique companies and target industries.
 """
 
 import logging
-from bot.scrapers.yc import scrape_yc
 from bot.scrapers.greenhouse import scrape_greenhouse
 from bot.scrapers.lever import scrape_lever
-from bot.scrapers.wellfound import scrape_wellfound
 from bot.scrapers.linkedin import scrape_linkedin
-from bot.scrapers.orbiter import scrape_orbiter
 from bot.filters import is_sponsored
 from bot.deduper import filter_new, mark_seen
 from bot.slack import post_digest
@@ -37,8 +34,8 @@ INDUSTRY_KEYWORDS = {
         "data engineer", "data scientist", "data analyst", "analytics engineer",
         "business analyst", "data platform engineer", "data quality engineer",
         "power bi developer", "database reliability engineer", "postgresql engineer",
-        "staff data engineer", "ml engineer intern", "data science intern",
-        "analytics intern", "database administrator", "data analytics",
+        "staff data engineer", "data science intern", "analytics intern",
+        "database administrator", "data analytics",
     ],
     "Product & Design":       [
         "product manager", "product designer", "ux designer", "ui/ux designer",
@@ -55,13 +52,11 @@ INDUSTRY_KEYWORDS = {
         "mechanical engineer", "process engineer", "electrical engineer",
         "semiconductor engineer", "thin film", "renewable energy engineer",
         "bess engineer", "power electronics engineer", "ev powertrain",
-        "ev charger engineer", "battery engineer", "energy storage engineer",
-        "staff scientist", "material scientist",
+        "battery engineer", "energy storage engineer", "staff scientist",
     ],
     "Finance & Strategy":     [
         "fp&a", "financial analyst", "finance manager", "strategic finance",
         "business analytics", "people analytics", "fp&a manager",
-        "finance manager", "senior finance",
     ],
     "Sports & Emerging Tech": [
         "sports technology", "sports analytics", "aviation engineer",
@@ -89,7 +84,7 @@ US_TERMS = [
     "miami", "washington", "nyc", "sf", "bay area", "mountain view",
     "palo alto", "san jose", "portland", "philadelphia", "dallas", "houston",
     "phoenix", "san diego", "raleigh", "minneapolis", "bellevue", "menlo park",
-    "remote",  # bare "remote" with no country suffix = assume US
+    "remote",
 ]
 
 
@@ -98,19 +93,18 @@ def classify(title: str) -> str:
     for industry, keywords in INDUSTRY_KEYWORDS.items():
         if any(k in t for k in keywords):
             return industry
-    return None  # None = no match = drop the job
+    return "Other"
 
 
 def is_us(job: dict) -> bool:
     loc = job.get("location", "").lower().strip()
     if not loc:
         return True
-    # Non-US check first (more specific wins)
     if any(t in loc for t in NON_US_TERMS):
         return False
     if any(t in loc for t in US_TERMS):
         return True
-    return False  # unrecognised location — exclude
+    return False
 
 
 def diversify(jobs: list, target: int = 15) -> list:
@@ -123,21 +117,20 @@ def diversify(jobs: list, target: int = 15) -> list:
             return (1, now)
         return (0, -p.timestamp())
 
-    # Sort priority: target industries first, "Other" last
-    priority = [j for j in jobs if j.get("industry") != "Other"]
-    other = [j for j in jobs if j.get("industry") == "Other"]
+    # Priority: target industries first, "Other" last; within each group, newest first
+    priority = sorted([j for j in jobs if j.get("industry") != "Other"], key=sort_key)
+    other    = sorted([j for j in jobs if j.get("industry") == "Other"],    key=sort_key)
     jobs = priority + other
 
     seen_companies = set()
     industry_counts = {k: 0 for k in INDUSTRY_KEYWORDS}
+    industry_counts["Other"] = 0
     selected = []
 
     for job in jobs:
-        company = job.get("company", "").lower().strip()
-        industry = job.get("industry")
+        company  = job.get("company", "").lower().strip()
+        industry = job.get("industry", "Other")
 
-        if not industry:
-            continue
         if company and company in seen_companies:
             continue
         if industry_counts.get(industry, 0) >= 2:
@@ -157,8 +150,7 @@ def run():
     log.info("Starting O1 job scrape…")
 
     raw = []
-    for scraper in [scrape_yc, scrape_greenhouse, scrape_lever,
-                    scrape_wellfound, scrape_linkedin, scrape_orbiter]:
+    for scraper in [scrape_greenhouse, scrape_lever, scrape_linkedin]:
         try:
             results = scraper()
             log.info(f"{scraper.__name__} → {len(results)} raw jobs")
@@ -168,24 +160,23 @@ def run():
 
     log.info(f"Total raw listings: {len(raw)}")
 
-    # 1. Classify by industry — unmatched jobs get "Other" and go to the back of the queue
-    for j in filtered:
-        j["industry"] = classify(j.get("title", "")) or "Other"
-    log.info(f"After classification: {len(filtered)} jobs")
+    # 1. Classify — target industries first, rest = "Other"
+    for j in raw:
+        j["industry"] = classify(j.get("title", ""))
 
-    # 3. Visa sponsorship filter
-    filtered = [j for j in filtered if is_sponsored(j.get("company", ""), j.get("description", ""))]
+    # 2. Visa sponsorship filter
+    filtered = [j for j in raw if is_sponsored(j.get("company", ""), j.get("description", ""))]
     log.info(f"After visa filter: {len(filtered)}")
 
-    # 4. US-only filter
+    # 3. US-only filter
     filtered = [j for j in filtered if is_us(j)]
     log.info(f"After US filter: {len(filtered)}")
 
-    # 5. Drop jobs with no valid direct URL
+    # 4. Drop jobs with no valid direct URL
     filtered = [j for j in filtered if j.get("url", "").startswith("http")]
     log.info(f"After URL filter: {len(filtered)}")
 
-    # 6. Dedup against previously seen jobs
+    # 5. Dedup against previously seen jobs
     new_jobs = filter_new(filtered)
     log.info(f"New this week: {len(new_jobs)}")
 
@@ -193,7 +184,7 @@ def run():
         log.info("No new jobs — skipping Slack post.")
         return
 
-    # 7. Pick 15 diverse roles
+    # 6. Pick 15 diverse roles
     diverse = diversify(new_jobs, target=15)
     industries = set(j["industry"] for j in diverse)
     log.info(f"Final selection: {len(diverse)} jobs across {len(industries)} industries: {industries}")
