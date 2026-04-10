@@ -190,7 +190,7 @@ def run():
     log.info(f"Final selection: {len(diverse)} jobs across {len(industries)} industries: {industries}")
 
     post_digest(diverse)
-    mark_seen(new_jobs)
+    mark_seen(diverse)  # only mark the 15 posted jobs as seen, not all 364
     log.info("Done.")
 
 
