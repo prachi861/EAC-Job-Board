@@ -52,6 +52,8 @@ def fetch_profiles() -> list[dict]:
 
         for msg in data.get("messages", []):
             profile = parse_profile(msg)
+            if not profile:
+                profile = parse_freeform_profile(msg)
             if profile:
                 profiles.append(profile)
 
@@ -140,11 +142,72 @@ def parse_profile(msg: dict) -> dict | None:
 
 # ── 2. Match jobs to profile using Claude ────────────────────────────────────
 
-def match_jobs(profile: dict, jobs: list[dict]) -> list[dict]:
+def parse_freeform_profile(msg: dict) -> dict | None:
     """
-    Matches jobs to a member profile using keyword scoring.
-    Scores each job by how many words from the desired role / industry
-    appear in the job title, then returns the top 2.
+    Fallback parser for non-workflow posts from members looking for jobs.
+    Detects job-seeking intent and extracts role keywords from free text.
+    """
+    full_text = msg.get("text", "")
+    if not full_text or len(full_text) < 50:
+        return None
+
+    # Must show job-seeking intent
+    intent_keywords = [
+        "looking for", "seeking", "open to", "job search", "laid off",
+        "let go", "restructur", "opportunities", "hiring", "connect with",
+        "referral", "openings", "job hunting", "available for",
+    ]
+    t = full_text.lower()
+    if not any(k in t for k in intent_keywords):
+        return None
+
+    # Skip workflow posts — those are handled by parse_profile
+    if "seeking opportunity" in t:
+        return None
+
+    # Extract role keywords from text
+    ROLE_TERMS = [
+        "software engineer", "backend", "frontend", "full stack", "data engineer",
+        "data analyst", "data scientist", "machine learning", "ai engineer",
+        "product manager", "product owner", "product designer", "ux", "ui",
+        "business analyst", "analytics", "devops", "platform engineer",
+        "finance", "fp&a", "strategy", "mechanical engineer", "process engineer",
+        "project manager", "program manager", "research engineer",
+    ]
+    found_roles = [r for r in ROLE_TERMS if r in t]
+    desired_role = ", ".join(found_roles) if found_roles else "open to opportunities"
+
+    # Extract LinkedIn URL if present
+    linkedin = ""
+    link_match = re.search(r"https?://(?:www\.)?linkedin\.com/in/[^\s>]+", full_text)
+    if link_match:
+        linkedin = link_match.group(0)
+
+    # Resolve @mention or use message sender
+    user_id = msg.get("user")
+    mention_match = re.search(r"<@([A-Z0-9]+)>", full_text)
+    if mention_match:
+        user_id = mention_match.group(1)
+
+    # Extract name if message starts with it (e.g. "Husna Shahid [1:43 PM]")
+    # In Slack API the sender's user ID is in msg["user"]
+    return {
+        "user_id":      user_id,
+        "slack_handle": f"<@{user_id}>" if user_id else "",
+        "location":     "",  # unknown — treat as willing to relocate
+        "industry":     "open",
+        "desired_role": desired_role,
+        "experience":   "",
+        "pitch":        full_text[:200],
+        "freeform":     True,
+        "linkedin":     linkedin,
+    }
+
+
+
+    """
+    Matches jobs to a member profile using keyword + location scoring.
+    Scores each job by role keywords and location preference, returns top 2.
     """
     if not jobs:
         return []
@@ -152,12 +215,32 @@ def match_jobs(profile: dict, jobs: list[dict]) -> list[dict]:
     desired = (profile.get("desired_role", "") + " " + profile.get("industry", "")).lower()
     keywords = [w for w in re.split(r'\W+', desired) if len(w) > 2]
 
+    profile_loc = profile.get("location", "").lower()
+    willing_to_relocate = "relocat" in profile_loc
+    # Extract state/city from location e.g. "MN, USA" → "mn"
+    loc_parts = [p.strip().lower() for p in re.split(r'[,.]', profile_loc) if p.strip()]
+    specific_locs = [l for l in loc_parts if l not in ("usa", "us", "united states", "remote")]
+
     def score(job):
         title = job.get("title", "").lower()
-        return sum(1 for k in keywords if k in title)
+        job_loc = job.get("location", "").lower()
+
+        # Role keyword score
+        role_score = sum(1 for k in keywords if k in title)
+
+        # Location score
+        if "remote" in job_loc:
+            loc_score = 2  # remote works for everyone
+        elif willing_to_relocate:
+            loc_score = 1  # any US location is fine
+        elif any(l in job_loc for l in specific_locs):
+            loc_score = 3  # exact location match gets highest score
+        else:
+            loc_score = 0  # wrong location, deprioritize
+
+        return role_score + loc_score
 
     scored = sorted(jobs, key=score, reverse=True)
-    # Return top 2 that have at least 1 keyword match, fallback to top 2 overall
     matches = [j for j in scored if score(j) > 0][:2]
     return matches if matches else scored[:2]
 
