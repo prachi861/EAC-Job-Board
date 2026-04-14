@@ -5,7 +5,6 @@ and sends personalised 1-2 job recommendations to each member via Slack DM.
 
 import os
 import re
-import json
 import logging
 import requests
 
