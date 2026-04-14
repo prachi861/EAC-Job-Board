@@ -65,31 +65,10 @@ def fetch_profiles() -> list[dict]:
 def parse_profile(msg: dict) -> dict | None:
     """
     Parses a Slack workflow message into a structured profile dict.
-    Expects fields: Slack Handle, Your Location, Industry or Field,
-    Desired Role, Years of Experience, Pitch Yourself...
+    Fields are all on one line separated by field label keywords.
     """
-    text = msg.get("text", "")
-
-    # Only process "Seeking Opportunity" workflow posts
-    if "Seeking Opportunity" not in text and "seeking opportunity" not in text.lower():
-        # Also check attachments/blocks
-        blocks = msg.get("blocks", [])
-        block_text = " ".join(
-            el.get("text", {}).get("text", "")
-            for b in blocks
-            for el in (b.get("elements", []) or [b])
-            if isinstance(el, dict)
-        )
-        if "Seeking Opportunity" not in block_text:
-            return None
-
-    # Extract fields using regex
-    def extract(label: str, src: str) -> str:
-        m = re.search(rf"{re.escape(label)}\s*\n([^\n]+)", src, re.IGNORECASE)
-        return m.group(1).strip() if m else ""
-
-    # Try to get full text from blocks if plain text is empty
-    full_text = text
+    # Gather all text from the message
+    full_text = msg.get("text", "")
     if not full_text:
         blocks = msg.get("blocks", [])
         parts = []
@@ -97,18 +76,47 @@ def parse_profile(msg: dict) -> dict | None:
             for el in b.get("elements", [b]):
                 if isinstance(el, dict) and el.get("text"):
                     t = el["text"]
-                    if isinstance(t, dict):
-                        parts.append(t.get("text", ""))
-                    else:
-                        parts.append(str(t))
-        full_text = "\n".join(parts)
+                    parts.append(t.get("text", "") if isinstance(t, dict) else str(t))
+        full_text = " ".join(parts)
 
-    slack_handle = extract("Slack Handle", full_text)
-    location     = extract("Your Location", full_text)
-    industry     = extract("Industry or Field", full_text)
-    desired_role = extract("Desired Role", full_text)
-    experience   = extract("Years of Experience", full_text)
-    pitch        = extract("Pitch Yourself", full_text)
+    if not full_text:
+        return None
+
+    # Only process "Seeking Opportunity" posts
+    if "seeking opportunity" not in full_text.lower():
+        return None
+
+    # Fields appear in order — extract value between one label and the next
+    FIELDS = [
+        "Slack Handle",
+        "Your Location",
+        "Industry or Field",
+        "Desired Role",
+        "Years of Experience",
+        "Link to Portfolio",
+        "Pitch Yourself For Your Dream Job In One Sentence",
+    ]
+
+    def extract_between(src: str, start_label: str, end_label: str | None) -> str:
+        pattern = (
+            rf"{re.escape(start_label)}\s*(.+?)\s*{re.escape(end_label)}"
+            if end_label
+            else rf"{re.escape(start_label)}\s*(.+?)$"
+        )
+        m = re.search(pattern, src, re.IGNORECASE | re.DOTALL)
+        return m.group(1).strip() if m else ""
+
+    values = {}
+    for i, label in enumerate(FIELDS):
+        next_label = FIELDS[i + 1] if i + 1 < len(FIELDS) else None
+        values[label] = extract_between(full_text, label, next_label)
+
+    slack_handle = values.get("Slack Handle", "")
+    location     = values.get("Your Location", "")
+    industry     = values.get("Industry or Field", "")
+    desired_role = values.get("Desired Role", "")
+    experience   = values.get("Years of Experience", "")
+    pitch        = values.get("Pitch Yourself For Your Dream Job In One Sentence", "")
 
     if not desired_role and not slack_handle:
         return None
