@@ -12,7 +12,6 @@ import requests
 log = logging.getLogger(__name__)
 
 SLACK_BOT_TOKEN  = os.environ["SLACK_BOT_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 SEEKING_CHANNEL_ID = os.environ.get("SEEKING_CHANNEL_ID", "C0AD3CPTN6Q")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
@@ -136,55 +135,24 @@ def parse_profile(msg: dict) -> dict | None:
 
 def match_jobs(profile: dict, jobs: list[dict]) -> list[dict]:
     """
-    Uses Claude to pick the 1-2 best matching jobs for a member profile.
-    Returns a list of matched job dicts.
+    Matches jobs to a member profile using keyword scoring.
+    Scores each job by how many words from the desired role / industry
+    appear in the job title, then returns the top 2.
     """
     if not jobs:
         return []
 
-    job_list = "\n".join(
-        f"{i+1}. {j['title']} at {j['company']} | {j.get('location','Remote')} | {j.get('url','')}"
-        for i, j in enumerate(jobs)
-    )
+    desired = (profile.get("desired_role", "") + " " + profile.get("industry", "")).lower()
+    keywords = [w for w in re.split(r'\W+', desired) if len(w) > 2]
 
-    prompt = f"""You are a job matching assistant for O-1 visa holders in the US.
+    def score(job):
+        title = job.get("title", "").lower()
+        return sum(1 for k in keywords if k in title)
 
-Member profile:
-- Desired Role: {profile['desired_role']}
-- Industry: {profile['industry']}
-- Location: {profile['location']}
-- Experience: {profile['experience']} years
-- Pitch: {profile['pitch']}
-
-Available jobs:
-{job_list}
-
-Pick the 1-2 jobs that best match this person's desired role and industry.
-Respond ONLY with a JSON array of the job numbers you selected, e.g. [3] or [1, 4].
-No explanation, just the JSON array."""
-
-    r = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": prompt}],
-        },
-        timeout=30,
-    )
-
-    try:
-        text = r.json()["content"][0]["text"].strip()
-        indices = json.loads(text)
-        return [jobs[i - 1] for i in indices if 1 <= i <= len(jobs)]
-    except Exception as e:
-        log.warning(f"Claude matching failed for {profile.get('slack_handle')}: {e}")
-        return jobs[:1]  # fallback: just send the first job
+    scored = sorted(jobs, key=score, reverse=True)
+    # Return top 2 that have at least 1 keyword match, fallback to top 2 overall
+    matches = [j for j in scored if score(j) > 0][:2]
+    return matches if matches else scored[:2]
 
 
 # ── 3. Send DM ────────────────────────────────────────────────────────────────
