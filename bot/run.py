@@ -1,303 +1,202 @@
 """
-DM flow — reads member profiles from #job-board, matches jobs using Claude,
-and sends personalised 1-2 job recommendations to each member via Slack DM.
+Entrypoint — runs all scrapers, dedupes, filters, posts to Slack.
+Selects up to 15 diverse roles across unique companies and target industries.
 """
 
-import os
-import re
-import json
 import logging
-import requests
+from bot.scrapers.greenhouse import scrape_greenhouse
+from bot.scrapers.lever import scrape_lever
+from bot.scrapers.linkedin import scrape_linkedin
+from bot.filters import is_sponsored
+from bot.deduper import filter_new, mark_seen
+from bot.slack import post_digest
+from bot.dm import run_dm_flow
 
 log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-SLACK_BOT_TOKEN  = os.environ["SLACK_BOT_TOKEN"]
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-SEEKING_CHANNEL_ID = os.environ.get("SEEKING_CHANNEL_ID", "C0AD3CPTN6Q")
-DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
-
-SLACK_HEADERS = {
-    "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
-    "Content-Type": "application/json",
+INDUSTRY_KEYWORDS = {
+    "AI/ML Engineering":      [
+        "machine learning engineer", "ml engineer", "ai engineer",
+        "artificial intelligence engineer", "llm engineer", "nlp engineer",
+        "deep learning engineer", "genai engineer", "research engineer",
+        "applied scientist", "ai scientist", "ai researcher", "ml researcher",
+        "ai/ml engineer", "generative ai",
+    ],
+    "Software Engineering":   [
+        "software engineer", "backend engineer", "frontend engineer",
+        "full stack engineer", "fullstack engineer", "full-stack engineer",
+        "react engineer", "java engineer", "java developer", "web developer",
+        "swe", "sde", "distributed systems engineer", "devops engineer",
+        "platform engineer", "infrastructure engineer", "systems engineer",
+        "android engineer", "ios engineer", "mobile engineer",
+    ],
+    "Data & Analytics":       [
+        "data engineer", "data scientist", "data analyst", "analytics engineer",
+        "business analyst", "data platform engineer", "data quality engineer",
+        "power bi developer", "database reliability engineer", "postgresql engineer",
+        "staff data engineer", "data science intern", "analytics intern",
+        "database administrator", "data analytics",
+    ],
+    "Product & Design":       [
+        "product manager", "product designer", "ux designer", "ui/ux designer",
+        "ui designer", "product design", "product marketing manager",
+        "project manager", "program manager", "ux researcher",
+        "people operations", "hr analyst",
+    ],
+    "IT & Infrastructure":    [
+        "it manager", "it software", "sap fico", "data platform engineer",
+        "cloud engineer", "database admin", "database reliability",
+        "site reliability engineer", "sre",
+    ],
+    "Engineering & Science":  [
+        "mechanical engineer", "process engineer", "electrical engineer",
+        "semiconductor engineer", "thin film", "renewable energy engineer",
+        "bess engineer", "power electronics engineer", "ev powertrain",
+        "battery engineer", "energy storage engineer", "staff scientist",
+    ],
+    "Finance & Strategy":     [
+        "fp&a", "financial analyst", "finance manager", "strategic finance",
+        "business analytics", "people analytics", "fp&a manager",
+    ],
+    "Sports & Emerging Tech": [
+        "sports technology", "sports analytics", "aviation engineer",
+    ],
 }
 
+NON_US_TERMS = [
+    "ireland", "dublin", "remote - ireland", "remote, ireland",
+    "united kingdom", "london", "remote - uk", "remote, uk", " uk,", "(uk)",
+    "canada", "toronto", "vancouver", "remote - ca", "remote, canada",
+    "australia", "sydney", "melbourne",
+    "india", "bangalore", "bengaluru", "hyderabad",
+    "germany", "berlin", "munich",
+    "france", "paris",
+    "netherlands", "amsterdam",
+    "singapore",
+    "new zealand", "auckland",
+    "remote - eu", "remote, eu", "europe",
+]
 
-# ── 1. Read profiles from #job-board ─────────────────────────────────────────
+US_TERMS = [
+    "united states", "usa", " us,", "(us)", "remote, us", "remote (us)",
+    "us remote", "remote - us", "new york", "san francisco", "seattle",
+    "austin", "boston", "chicago", "los angeles", "denver", "atlanta",
+    "miami", "washington", "nyc", "sf", "bay area", "mountain view",
+    "palo alto", "san jose", "portland", "philadelphia", "dallas", "houston",
+    "phoenix", "san diego", "raleigh", "minneapolis", "bellevue", "menlo park",
+    "remote",
+]
 
-def fetch_profiles() -> list[dict]:
-    """
-    Reads the last 200 messages from #job-board and extracts
-    'Seeking Opportunity' workflow submissions.
-    """
-    log.info("Fetching profiles from #job-board…")
-    profiles = []
-    cursor = None
 
-    while True:
-        params = {
-            "channel": SEEKING_CHANNEL_ID,
-            "limit": 200,
-        }
-        if cursor:
-            params["cursor"] = cursor
+def classify(title: str) -> str:
+    t = title.lower()
+    for industry, keywords in INDUSTRY_KEYWORDS.items():
+        if any(k in t for k in keywords):
+            return industry
+    return "Other"
 
-        r = requests.get(
-            "https://slack.com/api/conversations.history",
-            headers=SLACK_HEADERS,
-            params=params,
-            timeout=15,
-        )
-        data = r.json()
-        if not data.get("ok"):
-            log.error(f"Slack API error: {data.get('error')}")
+
+def is_us(job: dict) -> bool:
+    loc = job.get("location", "").lower().strip()
+    if not loc:
+        return True
+    if any(t in loc for t in NON_US_TERMS):
+        return False
+    if any(t in loc for t in US_TERMS):
+        return True
+    return False
+
+
+def diversify(jobs: list, target: int = 15) -> list:
+    from datetime import timezone, datetime
+    now = datetime.now(tz=timezone.utc)
+
+    def sort_key(j):
+        p = j.get("posted_at")
+        if p is None:
+            return (1, now)
+        return (0, -p.timestamp())
+
+    # Priority: target industries first, "Other" last; within each group, newest first
+    priority = sorted([j for j in jobs if j.get("industry") != "Other"], key=sort_key)
+    other    = sorted([j for j in jobs if j.get("industry") == "Other"],    key=sort_key)
+    jobs = priority + other
+
+    seen_companies = {}
+    industry_counts = {k: 0 for k in INDUSTRY_KEYWORDS}
+    industry_counts["Other"] = 0
+    selected = []
+
+    for job in jobs:
+        company  = job.get("company", "").lower().strip()
+        industry = job.get("industry", "Other")
+
+        if company and seen_companies.get(company, 0) >= 2:
+            continue
+        if industry_counts.get(industry, 0) >= 3:
+            continue
+
+        seen_companies[company] = seen_companies.get(company, 0) + 1
+        industry_counts[industry] = industry_counts.get(industry, 0) + 1
+        selected.append(job)
+
+        if len(selected) >= target:
             break
 
-        for msg in data.get("messages", []):
-            profile = parse_profile(msg)
-            if profile:
-                profiles.append(profile)
-
-        # Only fetch one page — last 200 messages is enough
-        break
-
-    log.info(f"Found {len(profiles)} member profiles")
-    return profiles
+    return selected
 
 
-def parse_profile(msg: dict) -> dict | None:
-    """
-    Parses a Slack workflow message into a structured profile dict.
-    Expects fields: Slack Handle, Your Location, Industry or Field,
-    Desired Role, Years of Experience, Pitch Yourself...
-    """
-    text = msg.get("text", "")
+def run():
+    log.info("Starting O1 job scrape…")
 
-    # Only process "Seeking Opportunity" workflow posts
-    if "Seeking Opportunity" not in text and "seeking opportunity" not in text.lower():
-        # Also check attachments/blocks
-        blocks = msg.get("blocks", [])
-        block_text = " ".join(
-            el.get("text", {}).get("text", "")
-            for b in blocks
-            for el in (b.get("elements", []) or [b])
-            if isinstance(el, dict)
-        )
-        if "Seeking Opportunity" not in block_text:
-            return None
-
-    # Extract fields using regex
-    def extract(label: str, src: str) -> str:
-        m = re.search(rf"{re.escape(label)}\s*\n([^\n]+)", src, re.IGNORECASE)
-        return m.group(1).strip() if m else ""
-
-    # Try to get full text from blocks if plain text is empty
-    full_text = text
-    if not full_text:
-        blocks = msg.get("blocks", [])
-        parts = []
-        for b in blocks:
-            for el in b.get("elements", [b]):
-                if isinstance(el, dict) and el.get("text"):
-                    t = el["text"]
-                    if isinstance(t, dict):
-                        parts.append(t.get("text", ""))
-                    else:
-                        parts.append(str(t))
-        full_text = "\n".join(parts)
-
-    slack_handle = extract("Slack Handle", full_text)
-    location     = extract("Your Location", full_text)
-    industry     = extract("Industry or Field", full_text)
-    desired_role = extract("Desired Role", full_text)
-    experience   = extract("Years of Experience", full_text)
-    pitch        = extract("Pitch Yourself", full_text)
-
-    if not desired_role and not slack_handle:
-        return None
-
-    # Resolve @mention to user ID
-    user_id = None
-    mention_match = re.search(r"<@([A-Z0-9]+)>", full_text)
-    if mention_match:
-        user_id = mention_match.group(1)
-
-    return {
-        "user_id":      user_id,
-        "slack_handle": slack_handle,
-        "location":     location,
-        "industry":     industry,
-        "desired_role": desired_role,
-        "experience":   experience,
-        "pitch":        pitch,
-    }
-
-
-# ── 2. Match jobs to profile using Claude ────────────────────────────────────
-
-def match_jobs(profile: dict, jobs: list[dict]) -> list[dict]:
-    """
-    Uses Claude to pick the 1-2 best matching jobs for a member profile.
-    Returns a list of matched job dicts.
-    """
-    if not jobs:
-        return []
-
-    job_list = "\n".join(
-        f"{i+1}. {j['title']} at {j['company']} | {j.get('location','Remote')} | {j.get('url','')}"
-        for i, j in enumerate(jobs)
-    )
-
-    prompt = f"""You are a job matching assistant for O-1 visa holders in the US.
-
-Member profile:
-- Desired Role: {profile['desired_role']}
-- Industry: {profile['industry']}
-- Location: {profile['location']}
-- Experience: {profile['experience']} years
-- Pitch: {profile['pitch']}
-
-Available jobs:
-{job_list}
-
-Pick the 1-2 jobs that best match this person's desired role and industry.
-Respond ONLY with a JSON array of the job numbers you selected, e.g. [3] or [1, 4].
-No explanation, just the JSON array."""
-
-    r = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 100,
-            "messages": [{"role": "user", "content": prompt}],
-        },
-        timeout=30,
-    )
-
-    try:
-        text = r.json()["content"][0]["text"].strip()
-        indices = json.loads(text)
-        return [jobs[i - 1] for i in indices if 1 <= i <= len(jobs)]
-    except Exception as e:
-        log.warning(f"Claude matching failed for {profile.get('slack_handle')}: {e}")
-        return jobs[:1]  # fallback: just send the first job
-
-
-# ── 3. Send DM ────────────────────────────────────────────────────────────────
-
-def open_dm(user_id: str) -> str | None:
-    """Opens a DM channel with a user and returns the channel ID."""
-    r = requests.post(
-        "https://slack.com/api/conversations.open",
-        headers=SLACK_HEADERS,
-        json={"users": user_id},
-        timeout=10,
-    )
-    data = r.json()
-    if data.get("ok"):
-        return data["channel"]["id"]
-    log.warning(f"Could not open DM with {user_id}: {data.get('error')}")
-    return None
-
-
-def send_dm(user_id: str, profile: dict, matched_jobs: list[dict]):
-    """Sends a personalised DM with matched job recommendations."""
-    if not user_id:
-        log.warning(f"No user ID for {profile.get('slack_handle')} — skipping DM")
-        return
-
-    if DRY_RUN:
-        log.info(f"[DRY RUN] Would DM {profile.get('slack_handle')} ({user_id}):")
-        for job in matched_jobs:
-            log.info(f"  → {job['title']} at {job['company']} | {job.get('url','')}")
-        return
-
-    dm_channel = open_dm(user_id)
-    if not dm_channel:
-        return
-
-    name = profile.get("slack_handle", "there").lstrip("@").split()[0]
-    role = profile.get("desired_role", "your target role")
-
-    job_blocks = []
-    for job in matched_jobs:
-        url = job.get("url", "")
-        title = job.get("title", "")
-        company = job.get("company", "")
-        location = job.get("location", "Remote")
-        link = f"<{url}|{title}>" if url else title
-
-        job_blocks.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"• *{link}*\n  {company}  —  {location}",
-            },
-        })
-
-    blocks = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f"👋 Hey {name}! I'm *EAC Job Bot*.\n\n"
-                    f"Based on your profile _{role}_, here are this week's top picks for you:"
-                ),
-            },
-        },
-        {"type": "divider"},
-        *job_blocks,
-        {"type": "divider"},
-        {
-            "type": "context",
-            "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": "These roles are O-1 friendly. Always verify visa sponsorship directly with the employer. Good luck! 🚀",
-                }
-            ],
-        },
-    ]
-
-    r = requests.post(
-        "https://slack.com/api/chat.postMessage",
-        headers=SLACK_HEADERS,
-        json={"channel": dm_channel, "blocks": blocks},
-        timeout=10,
-    )
-    if r.json().get("ok"):
-        log.info(f"DM sent to {profile.get('slack_handle')}")
-    else:
-        log.warning(f"DM failed for {profile.get('slack_handle')}: {r.json().get('error')}")
-
-
-# ── 4. Main entry point ───────────────────────────────────────────────────────
-
-def run_dm_flow(jobs: list[dict]):
-    """
-    Called after the main scraper run with the full job list.
-    Reads profiles, matches jobs, sends DMs.
-    """
-    log.info("Starting DM flow…")
-    profiles = fetch_profiles()
-
-    if not profiles:
-        log.info("No profiles found — skipping DMs.")
-        return
-
-    for profile in profiles:
+    raw = []
+    for scraper in [scrape_greenhouse, scrape_lever, scrape_linkedin]:
         try:
-            matched = match_jobs(profile, jobs)
-            if matched:
-                send_dm(profile["user_id"], profile, matched)
-            else:
-                log.info(f"No matches for {profile.get('slack_handle')}")
+            results = scraper()
+            log.info(f"{scraper.__name__} → {len(results)} raw jobs")
+            raw += results
         except Exception as e:
-            log.error(f"DM flow failed for {profile.get('slack_handle')}: {e}")
+            log.error(f"{scraper.__name__} failed: {e}")
 
-    log.info("DM flow complete.")
+    log.info(f"Total raw listings: {len(raw)}")
+
+    # 1. Classify — target industries first, rest = "Other"
+    for j in raw:
+        j["industry"] = classify(j.get("title", ""))
+
+    # 2. Visa sponsorship filter
+    filtered = [j for j in raw if is_sponsored(j.get("company", ""), j.get("description", ""))]
+    log.info(f"After visa filter: {len(filtered)}")
+
+    # 3. US-only filter
+    filtered = [j for j in filtered if is_us(j)]
+    log.info(f"After US filter: {len(filtered)}")
+
+    # 4. Drop jobs with no valid direct URL
+    filtered = [j for j in filtered if j.get("url", "").startswith("http")]
+    log.info(f"After URL filter: {len(filtered)}")
+
+    # 5. Dedup against previously seen jobs
+    new_jobs = filter_new(filtered)
+    log.info(f"New this week: {len(new_jobs)}")
+
+    if not new_jobs:
+        log.info("No new jobs — skipping Slack post.")
+        return
+
+    # 6. Pick 15 diverse roles
+    diverse = diversify(new_jobs, target=15)
+    industries = set(j["industry"] for j in diverse)
+    log.info(f"Final selection: {len(diverse)} jobs across {len(industries)} industries: {industries}")
+
+    post_digest(diverse)
+    mark_seen(diverse)
+
+    # Send personalised DMs — pass full filtered list so Claude has more to match from
+    run_dm_flow(filtered)
+    log.info("Done.")
+
+
+if __name__ == "__main__":
+    run()
