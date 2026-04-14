@@ -30,7 +30,6 @@ jobs:
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SEEKING_CHANNEL_ID: C0AD3CPTN6Q
           DRY_RUN: "true"  # remove this line when ready to go live
 
