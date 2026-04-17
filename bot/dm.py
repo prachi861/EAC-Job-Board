@@ -12,6 +12,7 @@ log = logging.getLogger(__name__)
 
 SLACK_BOT_TOKEN  = os.environ["SLACK_BOT_TOKEN"]
 SEEKING_CHANNEL_ID = os.environ.get("SEEKING_CHANNEL_ID", "C0AD3CPTN6Q")
+ADMIN_CHANNEL_ID = os.environ.get("ADMIN_CHANNEL_ID", "")  # #job-bot-test channel ID
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
 SLACK_HEADERS = {
@@ -247,7 +248,30 @@ def parse_freeform_profile(msg: dict) -> dict | None:
 
 # ── 3. Send DM ────────────────────────────────────────────────────────────────
 
-def open_dm(user_id: str) -> str | None:
+def post_admin_preview(profile: dict, matched_jobs: list[dict]):
+    """Posts a preview of what would be DMed to the admin channel."""
+    if not ADMIN_CHANNEL_ID:
+        return
+    name = profile.get("slack_handle", "unknown")
+    role = profile.get("desired_role", "unknown")
+    lines = [f"*Preview DM → {name}* (_{role}_)"]
+    for job in matched_jobs:
+        url = job.get("url", "")
+        title = job.get("title", "")
+        company = job.get("company", "")
+        loc = job.get("location", "Remote")
+        link = f"<{url}|{title}>" if url else title
+        lines.append(f"  • *{link}* at {company} — {loc}")
+
+    requests.post(
+        "https://slack.com/api/chat.postMessage",
+        headers=SLACK_HEADERS,
+        json={
+            "channel": ADMIN_CHANNEL_ID,
+            "text": "\n".join(lines),
+        },
+        timeout=10,
+    )
     """Opens a DM channel with a user and returns the channel ID."""
     r = requests.post(
         "https://slack.com/api/conversations.open",
@@ -352,7 +376,9 @@ def run_dm_flow(jobs: list[dict]):
         try:
             matched = match_jobs(profile, jobs)
             if matched:
-                send_dm(profile["user_id"], profile, matched)
+                post_admin_preview(profile, matched)  # always post preview
+                if not DRY_RUN:
+                    send_dm(profile["user_id"], profile, matched)
             else:
                 log.info(f"No matches for {profile.get('slack_handle')}")
         except Exception as e:
