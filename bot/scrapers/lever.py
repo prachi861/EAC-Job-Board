@@ -9,33 +9,14 @@ log = logging.getLogger(__name__)
 HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
 
 # slug → display name (only verified working slugs)
+# Only slugs that have been confirmed working recently
 LEVER_COMPANIES = {
-    # AI / ML
-    "together":         "Together AI",
-    "mistral":          "Mistral",
-    "cohere":           "Cohere",
-    # SWE / Infra
-    "linear":           "Linear",
-    "notion":           "Notion",
-    "rippling":         "Rippling",
-    "retool":           "Retool",
-    "anyscale":         "Anyscale",
-    # Data
-    "dbt-labs":         "dbt Labs",
-    "prefect":          "Prefect",
-    "hightouch":        "Hightouch",
-    # Fintech
-    "brex":             "Brex",
-    "carta":            "Carta",
-    "deel":             "Deel",
-    "ramp":             "Ramp",
-    # Design
-    "figma":            "Figma",
-    "miro":             "Miro",
-    "airtable":         "Airtable",
-    # Renewable / Hardware
-    "samsara":          "Samsara",
-    "formenergy":       "Form Energy",
+    "anyscale":     "Anyscale",
+    "mistral":      "Mistral",
+    "carta":        "Carta",
+    "deel":         "Deel",
+    "ramp":         "Ramp",
+    "samsara":      "Samsara",
 }
 
 
@@ -46,7 +27,7 @@ def scrape_lever() -> list[dict]:
         try:
             r = requests.get(
                 f"https://api.lever.co/v0/postings/{slug}?mode=json",
-                headers=HEADERS, timeout=15,
+                headers=HEADERS, timeout=8,
             )
             r.raise_for_status()
             for job in r.json():
