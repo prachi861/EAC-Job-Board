@@ -31,6 +31,7 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SEEKING_CHANNEL_ID: C0AD3CPTN6Q
+          ADMIN_CHANNEL_ID: C0ARHGPNLF3
           DRY_RUN: "true"  # remove this line when ready to go live
 
         run: python -m bot.run
