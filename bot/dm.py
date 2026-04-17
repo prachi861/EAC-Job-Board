@@ -200,6 +200,9 @@ def fetch_profiles() -> list[dict]:
         for msg in data.get("messages", []):
             profile = parse_profile(msg) or parse_freeform_profile(msg)
             if profile:
+                handle = profile.get("slack_handle", "")
+                if "eac team" in handle.lower():
+                    continue
                 profiles.append(profile)
 
         # Follow pagination cursor if there are more messages
