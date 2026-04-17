@@ -202,6 +202,7 @@ def fetch_profiles() -> list[dict]:
 
 def post_admin_preview(profile: dict, matched_jobs: list[dict]):
     if not ADMIN_CHANNEL_ID:
+        log.warning("ADMIN_CHANNEL_ID not set — skipping preview")
         return
     name = profile.get("slack_handle") or f"<@{profile.get('user_id', 'unknown')}>"
     role = profile.get("desired_role", "unknown")
@@ -213,12 +214,17 @@ def post_admin_preview(profile: dict, matched_jobs: list[dict]):
         loc   = job.get("location", "Remote")
         link  = f"<{url}|{title}>" if url else title
         lines.append(f"  • *{link}* at {co} — {loc}")
-    requests.post(
+    r = requests.post(
         "https://slack.com/api/chat.postMessage",
         headers=SLACK_HEADERS,
         json={"channel": ADMIN_CHANNEL_ID, "text": "\n".join(lines)},
         timeout=10,
     )
+    result = r.json()
+    if result.get("ok"):
+        log.info(f"Preview posted for {name}")
+    else:
+        log.warning(f"Preview post failed for {name}: {result.get('error')}")
 
 
 # ── 5. Send DM ────────────────────────────────────────────────────────────────
