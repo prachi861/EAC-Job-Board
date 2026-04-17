@@ -25,8 +25,9 @@ SLACK_HEADERS = {
 
 def match_jobs(profile: dict, jobs: list[dict]) -> list[dict]:
     """
-    Matches jobs to a member profile using keyword + location scoring.
-    Returns top 2 matches.
+    Returns 2 matched jobs:
+    - 1 local/remote match (prioritising the member's city/state)
+    - 1 best role match from anywhere in the US
     """
     if not jobs:
         return []
@@ -35,27 +36,28 @@ def match_jobs(profile: dict, jobs: list[dict]) -> list[dict]:
     keywords = [w for w in re.split(r'\W+', desired) if len(w) > 2]
 
     profile_loc = profile.get("location", "").lower()
-    willing_to_relocate = "relocat" in profile_loc or not profile_loc
     loc_parts = [p.strip().lower() for p in re.split(r'[,.]', profile_loc) if p.strip()]
-    specific_locs = [l for l in loc_parts if l not in ("usa", "us", "united states", "remote", "")]
+    specific_locs = [l for l in loc_parts if l not in ("usa", "us", "united states", "remote", "willing to relocate", "")]
 
-    def score(job):
-        title   = job.get("title", "").lower()
-        job_loc = job.get("location", "").lower()
-        role_score = sum(1 for k in keywords if k in title)
-        if "remote" in job_loc:
-            loc_score = 2
-        elif willing_to_relocate:
-            loc_score = 1
-        elif any(l in job_loc for l in specific_locs):
-            loc_score = 3
-        else:
-            loc_score = 0
-        return role_score + loc_score
+    def role_score(job):
+        title = job.get("title", "").lower()
+        return sum(1 for k in keywords if k in title)
 
-    scored = sorted(jobs, key=score, reverse=True)
-    matches = [j for j in scored if score(j) > 0][:2]
-    return matches if matches else scored[:2]
+    def is_local_or_remote(job):
+        loc = job.get("location", "").lower()
+        return "remote" in loc or any(l in loc for l in specific_locs)
+
+    # Sort all jobs by role score
+    sorted_jobs = sorted(jobs, key=role_score, reverse=True)
+
+    # Pick best local/remote match
+    local_match = next((j for j in sorted_jobs if is_local_or_remote(j)), None)
+
+    # Pick best overall role match (different from local)
+    other_match = next((j for j in sorted_jobs if j != local_match), None)
+
+    results = [j for j in [local_match, other_match] if j is not None]
+    return results if results else sorted_jobs[:2]
 
 
 # ── 2. Profile parsers ────────────────────────────────────────────────────────
@@ -177,22 +179,36 @@ def parse_freeform_profile(msg: dict) -> dict | None:
 def fetch_profiles() -> list[dict]:
     log.info("Fetching profiles from #job-board…")
     profiles = []
+    cursor = None
 
-    r = requests.get(
-        "https://slack.com/api/conversations.history",
-        headers=SLACK_HEADERS,
-        params={"channel": SEEKING_CHANNEL_ID, "limit": 200},
-        timeout=15,
-    )
-    data = r.json()
-    if not data.get("ok"):
-        log.error(f"Slack API error: {data.get('error')}")
-        return profiles
+    while True:
+        params = {"channel": SEEKING_CHANNEL_ID, "limit": 200}
+        if cursor:
+            params["cursor"] = cursor
 
-    for msg in data.get("messages", []):
-        profile = parse_profile(msg) or parse_freeform_profile(msg)
-        if profile:
-            profiles.append(profile)
+        r = requests.get(
+            "https://slack.com/api/conversations.history",
+            headers=SLACK_HEADERS,
+            params=params,
+            timeout=15,
+        )
+        data = r.json()
+        if not data.get("ok"):
+            log.error(f"Slack API error: {data.get('error')}")
+            break
+
+        for msg in data.get("messages", []):
+            profile = parse_profile(msg) or parse_freeform_profile(msg)
+            if profile:
+                profiles.append(profile)
+
+        # Follow pagination cursor if there are more messages
+        next_cursor = data.get("response_metadata", {}).get("next_cursor", "")
+        if next_cursor:
+            cursor = next_cursor
+            log.info(f"Fetching next page of messages…")
+        else:
+            break
 
     log.info(f"Found {len(profiles)} member profiles")
     return profiles
@@ -204,20 +220,32 @@ def post_admin_preview(profile: dict, matched_jobs: list[dict]):
     if not ADMIN_CHANNEL_ID:
         log.warning("ADMIN_CHANNEL_ID not set — skipping preview")
         return
-    name = profile.get("slack_handle") or f"<@{profile.get('user_id', 'unknown')}>"
-    role = profile.get("desired_role", "unknown")
-    lines = [f"*Preview DM → {name}* (_{role}_)"]
+
+    user_id = profile.get("user_id", "")
+    name = f"<@{user_id}>" if user_id else profile.get("slack_handle", "Unknown")
+    role = profile.get("desired_role", "Unknown role")
+    location = profile.get("location", "Location unknown")
+
+    job_lines = []
     for job in matched_jobs:
         url   = job.get("url", "")
         title = job.get("title", "")
         co    = job.get("company", "")
         loc   = job.get("location", "Remote")
         link  = f"<{url}|{title}>" if url else title
-        lines.append(f"  • *{link}* at {co} — {loc}")
+        job_lines.append(f"      • {link} at *{co}* — {loc}")
+
+    text = (
+        f":mailbox_with_mail: *Proposed DM* → {name}\n"
+        f">  *Role:* {role}\n"
+        f">  *Location:* {location}\n"
+        f">  *Matches:*\n" + "\n".join(f"> {l}" for l in job_lines)
+    )
+
     r = requests.post(
         "https://slack.com/api/chat.postMessage",
         headers=SLACK_HEADERS,
-        json={"channel": ADMIN_CHANNEL_ID, "text": "\n".join(lines)},
+        json={"channel": ADMIN_CHANNEL_ID, "text": text},
         timeout=10,
     )
     result = r.json()
@@ -257,29 +285,28 @@ def send_dm(user_id: str, profile: dict, matched_jobs: list[dict]):
     is_freeform = profile.get("freeform", False)
 
     intro = (
-        f"👋 Hey {name}! I'm *EAC Job Bot*.\n\nI saw your post in #job-board — here are this week's top picks that might be a fit for you:"
+        f"👋 Hey {name}!\nI saw your post in #job-board — here are some roles this week that might be a great fit for you:"
         if is_freeform else
-        f"👋 Hey {name}! I'm *EAC Job Bot*.\n\nBased on your profile _{role}_, here are this week's top picks for you:"
+        f"👋 Hey {name}!\nBased on your profile as a *{role}*, we found some roles this week that might be a great fit for you:"
     )
 
-    job_blocks = []
+    job_lines = []
     for job in matched_jobs:
         url   = job.get("url", "")
         title = job.get("title", "")
         co    = job.get("company", "")
         loc   = job.get("location", "Remote")
         link  = f"<{url}|{title}>" if url else title
-        job_blocks.append({
-            "type": "section",
-            "text": {"type": "mrkdwn", "text": f"• *{link}*\n  {co}  —  {loc}"},
-        })
+        job_lines.append(f"🔹 {link}\n*{co}* — {loc}")
+
+    footer = "✨ These companies are known to sponsor O-1 visas. Always verify sponsorship directly with the employer. Good luck! 🚀"
 
     blocks = [
         {"type": "section", "text": {"type": "mrkdwn", "text": intro}},
         {"type": "divider"},
-        *job_blocks,
+        *[{"type": "section", "text": {"type": "mrkdwn", "text": line}} for line in job_lines],
         {"type": "divider"},
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": "These roles are O-1 friendly. Always verify visa sponsorship directly with the employer. Good luck! 🚀"}]},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": footer}]},
     ]
 
     r = requests.post(
