@@ -1,344 +1,225 @@
 """
-DM flow — reads member profiles from #job-board, matches jobs using keyword
-scoring, and sends personalised 1-2 job recommendations via Slack DM.
+Entrypoint — runs all scrapers, dedupes, filters, posts to Slack.
+Selects up to 15 diverse roles across unique companies and target industries.
 """
 
-import os
-import re
 import logging
-import requests
+from bot.scrapers.greenhouse import scrape_greenhouse
+from bot.scrapers.lever import scrape_lever
+from bot.scrapers.linkedin import scrape_linkedin
+from bot.filters import is_sponsored
+from bot.deduper import filter_new, mark_seen
+from bot.slack import post_digest
+from bot.dm import run_dm_flow
+from bot.dm import run_dm_flow
 
 log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-SLACK_BOT_TOKEN    = os.environ["SLACK_BOT_TOKEN"]
-SEEKING_CHANNEL_ID = os.environ.get("SEEKING_CHANNEL_ID", "C0AD3CPTN6Q")
-ADMIN_CHANNEL_ID   = os.environ.get("ADMIN_CHANNEL_ID", "")
-DRY_RUN            = os.environ.get("DRY_RUN", "false").lower() == "true"
-
-SLACK_HEADERS = {
-    "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
-    "Content-Type": "application/json",
+INDUSTRY_KEYWORDS = {
+    "AI/ML Engineering":      [
+        "machine learning engineer", "ml engineer", "ai engineer",
+        "artificial intelligence engineer", "llm engineer", "nlp engineer",
+        "deep learning engineer", "genai engineer", "research engineer",
+        "applied scientist", "ai scientist", "ai researcher", "ml researcher",
+        "ai/ml engineer", "generative ai",
+    ],
+    "Software Engineering":   [
+        "software engineer", "backend engineer", "frontend engineer",
+        "full stack engineer", "fullstack engineer", "full-stack engineer",
+        "react engineer", "java engineer", "java developer", "web developer",
+        "swe", "sde", "distributed systems engineer", "devops engineer",
+        "platform engineer", "infrastructure engineer", "systems engineer",
+        "android engineer", "ios engineer", "mobile engineer",
+    ],
+    "Data & Analytics":       [
+        "data engineer", "data scientist", "data analyst", "analytics engineer",
+        "business analyst", "data platform engineer", "data quality engineer",
+        "power bi developer", "database reliability engineer", "postgresql engineer",
+        "staff data engineer", "data science intern", "analytics intern",
+        "database administrator", "data analytics",
+    ],
+    "Product & Design":       [
+        "product manager", "product designer", "ux designer", "ui/ux designer",
+        "ui designer", "product design", "product marketing manager",
+        "project manager", "program manager", "ux researcher",
+        "people operations", "hr analyst",
+    ],
+    "Marketing":              [
+        "marketing manager", "growth marketing", "content marketing",
+        "digital marketing", "brand marketing", "marketing analyst",
+        "demand generation", "seo", "performance marketing",
+        "social media manager", "marketing strategist",
+    ],
+    "IT & Infrastructure":    [
+        "it manager", "it software", "sap fico", "data platform engineer",
+        "cloud engineer", "database admin", "database reliability",
+        "site reliability engineer", "sre",
+    ],
+    "Engineering & Science":  [
+        "mechanical engineer", "process engineer", "electrical engineer",
+        "semiconductor engineer", "thin film", "renewable energy engineer",
+        "bess engineer", "power electronics engineer", "ev powertrain",
+        "battery engineer", "energy storage engineer", "staff scientist",
+    ],
+    "Finance & Strategy":     [
+        "fp&a", "financial analyst", "finance manager", "strategic finance",
+        "business analytics", "people analytics", "fp&a manager",
+    ],
+    "Sports & Emerging Tech": [
+        "sports technology", "sports analytics", "aviation engineer",
+    ],
 }
 
+NON_US_TERMS = [
+    "ireland", "dublin", "remote - ireland", "remote, ireland",
+    "united kingdom", "london", "remote - uk", "remote, uk", " uk,", "(uk)",
+    "canada", "toronto", "vancouver", "remote - ca", "remote, canada",
+    "australia", "sydney", "melbourne",
+    "india", "bangalore", "bengaluru", "hyderabad",
+    "germany", "berlin", "munich",
+    "france", "paris",
+    "netherlands", "amsterdam",
+    "singapore",
+    "new zealand", "auckland",
+    "remote - eu", "remote, eu", "europe",
+]
 
-# ── 1. Job matching ───────────────────────────────────────────────────────────
-
-def match_jobs(profile: dict, jobs: list[dict]) -> list[dict]:
-    """
-    Returns 2 matched jobs:
-    - 1 local/remote match (prioritising the member's city/state)
-    - 1 best role match from anywhere in the US
-    """
-    if not jobs:
-        return []
-
-    desired = (profile.get("desired_role", "") + " " + profile.get("industry", "")).lower()
-    keywords = [w for w in re.split(r'\W+', desired) if len(w) > 2]
-
-    profile_loc = profile.get("location", "").lower()
-    loc_parts = [p.strip().lower() for p in re.split(r'[,.]', profile_loc) if p.strip()]
-    specific_locs = [l for l in loc_parts if l not in ("usa", "us", "united states", "remote", "willing to relocate", "")]
-
-    def role_score(job):
-        title = job.get("title", "").lower()
-        return sum(1 for k in keywords if k in title)
-
-    def is_local_or_remote(job):
-        loc = job.get("location", "").lower()
-        return "remote" in loc or any(l in loc for l in specific_locs)
-
-    sorted_jobs = sorted(jobs, key=role_score, reverse=True)
-
-    local_match = next((j for j in sorted_jobs if is_local_or_remote(j)), None)
-    other_match = next((j for j in sorted_jobs if j != local_match), None)
-
-    results = [j for j in [local_match, other_match] if j is not None]
-    return results if results else sorted_jobs[:2]
+US_TERMS = [
+    "united states", "usa", " us,", "(us)", "remote, us", "remote (us)",
+    "us remote", "remote - us", "new york", "san francisco", "seattle",
+    "austin", "boston", "chicago", "los angeles", "denver", "atlanta",
+    "miami", "washington", "nyc", "sf", "bay area", "mountain view",
+    "palo alto", "san jose", "portland", "philadelphia", "dallas", "houston",
+    "phoenix", "san diego", "raleigh", "minneapolis", "bellevue", "menlo park",
+    "remote",
+]
 
 
-# ── 2. Profile parsers ────────────────────────────────────────────────────────
-
-def parse_profile(msg: dict) -> dict | None:
-    """Parses a structured 'Seeking Opportunity' workflow post."""
-    full_text = msg.get("text", "")
-    if not full_text:
-        blocks = msg.get("blocks", [])
-        parts = []
-        for b in blocks:
-            for el in b.get("elements", [b]):
-                if isinstance(el, dict) and el.get("text"):
-                    t = el["text"]
-                    parts.append(t.get("text", "") if isinstance(t, dict) else str(t))
-        full_text = " ".join(parts)
-
-    if not full_text:
-        return None
-
-    if "seeking opportunity" not in full_text.lower():
-        return None
-
-    FIELDS = [
-        "Slack Handle",
-        "Your Location",
-        "Industry or Field",
-        "Desired Role",
-        "Years of Experience",
-        "Link to Portfolio",
-        "Pitch Yourself For Your Dream Job In One Sentence",
-    ]
-
-    def extract_between(src, start_label, end_label):
-        pattern = (
-            rf"{re.escape(start_label)}\s*(.+?)\s*{re.escape(end_label)}"
-            if end_label
-            else rf"{re.escape(start_label)}\s*(.+?)$"
-        )
-        m = re.search(pattern, src, re.IGNORECASE | re.DOTALL)
-        return m.group(1).strip() if m else ""
-
-    values = {}
-    for i, label in enumerate(FIELDS):
-        next_label = FIELDS[i + 1] if i + 1 < len(FIELDS) else None
-        values[label] = extract_between(full_text, label, next_label)
-
-    slack_handle = values.get("Slack Handle", "")
-    desired_role = values.get("Desired Role", "")
-
-    if not desired_role and not slack_handle:
-        return None
-
-    user_id = msg.get("user")
-    mention_match = re.search(r"<@([A-Z0-9]+)>", full_text)
-    if mention_match:
-        user_id = mention_match.group(1)
-
-    return {
-        "user_id":      user_id,
-        "slack_handle": slack_handle,
-        "location":     values.get("Your Location", ""),
-        "industry":     values.get("Industry or Field", ""),
-        "desired_role": desired_role,
-        "experience":   values.get("Years of Experience", ""),
-        "pitch":        values.get("Pitch Yourself For Your Dream Job In One Sentence", ""),
-        "freeform":     False,
-    }
+def classify(title: str) -> str:
+    t = title.lower()
+    for industry, keywords in INDUSTRY_KEYWORDS.items():
+        if any(k in t for k in keywords):
+            return industry
+    return "Other"
 
 
-def parse_freeform_profile(msg: dict) -> dict | None:
-    """Fallback parser for non-workflow job-seeking posts."""
-    full_text = msg.get("text", "")
-    if not full_text or len(full_text) < 50:
-        return None
-
-    intent_keywords = [
-        "looking for", "seeking", "open to", "job search", "laid off",
-        "let go", "restructur", "opportunities", "hiring", "connect with",
-        "referral", "openings", "job hunting", "available for",
-    ]
-    t = full_text.lower()
-    if not any(k in t for k in intent_keywords):
-        return None
-
-    if "seeking opportunity" in t:
-        return None
-
-    ROLE_TERMS = [
-        "software engineer", "backend", "frontend", "full stack", "data engineer",
-        "data analyst", "data scientist", "machine learning", "ai engineer",
-        "product manager", "product owner", "product designer", "ux", "ui",
-        "business analyst", "analytics", "devops", "platform engineer",
-        "finance", "fp&a", "strategy", "mechanical engineer", "process engineer",
-        "project manager", "program manager", "research engineer",
-    ]
-    found_roles = [r for r in ROLE_TERMS if r in t]
-    desired_role = ", ".join(found_roles) if found_roles else "open to opportunities"
-
-    user_id = msg.get("user")
-    mention_match = re.search(r"<@([A-Z0-9]+)>", full_text)
-    if mention_match:
-        user_id = mention_match.group(1)
-
-    return {
-        "user_id":      user_id,
-        "slack_handle": f"<@{user_id}>" if user_id else "",
-        "location":     "",
-        "industry":     "open",
-        "desired_role": desired_role,
-        "experience":   "",
-        "pitch":        full_text[:200],
-        "freeform":     True,
-    }
+def is_us(job: dict) -> bool:
+    loc = job.get("location", "").lower().strip()
+    if not loc:
+        return True
+    if any(t in loc for t in NON_US_TERMS):
+        return False
+    if any(t in loc for t in US_TERMS):
+        return True
+    return False
 
 
-# ── 3. Read profiles from #job-board ─────────────────────────────────────────
+def normalize_company(name: str) -> str:
+    """Normalize company names to avoid near-duplicate matching."""
+    name = name.lower().strip()
+    # Remove common suffixes
+    for suffix in [" ai", " inc", " inc.", " llc", " ltd", " corp", " technologies", " tech"]:
+        if name.endswith(suffix):
+            name = name[:-len(suffix)].strip()
+    return name
 
-def fetch_profiles() -> list[dict]:
-    log.info("Fetching profiles from #job-board…")
-    profiles = []
-    cursor = None
 
-    while True:
-        params = {"channel": SEEKING_CHANNEL_ID, "limit": 200}
-        if cursor:
-            params["cursor"] = cursor
+def diversify(jobs: list, target: int = 15) -> list:
+    from datetime import timezone, datetime
+    now = datetime.now(tz=timezone.utc)
 
-        r = requests.get(
-            "https://slack.com/api/conversations.history",
-            headers=SLACK_HEADERS,
-            params=params,
-            timeout=15,
-        )
-        data = r.json()
-        if not data.get("ok"):
-            log.error(f"Slack API error: {data.get('error')}")
+    def sort_key(j):
+        p = j.get("posted_at")
+        if p is None:
+            return (1, now)
+        return (0, -p.timestamp())
+
+    # Priority: target industries first, "Other" last; within each group, newest first
+    priority = sorted([j for j in jobs if j.get("industry") != "Other"], key=sort_key)
+    other    = sorted([j for j in jobs if j.get("industry") == "Other"],    key=sort_key)
+    jobs = priority + other
+
+    seen_companies = {}
+    seen_title_company = set()  # catch same role posted in multiple locations
+    industry_counts = {k: 0 for k in INDUSTRY_KEYWORDS}
+    industry_counts["Other"] = 0
+    selected = []
+
+    for job in jobs:
+        company  = normalize_company(job.get("company", ""))
+        industry = job.get("industry", "Other")
+        title    = job.get("title", "").lower().strip()
+        title_co = f"{title}||{company}"
+
+        if company and seen_companies.get(company, 0) >= 1:
+            continue
+        if title_co in seen_title_company:
+            continue
+        if industry_counts.get(industry, 0) >= 3:
+            continue
+
+        seen_companies[company] = seen_companies.get(company, 0) + 1
+        seen_title_company.add(title_co)
+        industry_counts[industry] = industry_counts.get(industry, 0) + 1
+        selected.append(job)
+
+        if len(selected) >= target:
             break
 
-        for msg in data.get("messages", []):
-            profile = parse_profile(msg) or parse_freeform_profile(msg)
-            if profile:
-                handle = profile.get("slack_handle", "")
-                if "eac team" in handle.lower():
-                    continue
-                profiles.append(profile)
-
-        next_cursor = data.get("response_metadata", {}).get("next_cursor", "")
-        if next_cursor:
-            cursor = next_cursor
-            log.info("Fetching next page of messages…")
-        else:
-            break
-
-    log.info(f"Found {len(profiles)} member profiles")
-    return profiles
+    return selected
 
 
-# ── 4. Admin preview ──────────────────────────────────────────────────────────
+def run():
+    log.info("Starting O1 job scrape…")
 
-def post_admin_preview(profile: dict, matched_jobs: list[dict]):
-    if not ADMIN_CHANNEL_ID:
-        log.warning("ADMIN_CHANNEL_ID not set — skipping preview")
-        return
-
-    user_id  = profile.get("user_id", "")
-    name     = f"<@{user_id}>" if user_id else profile.get("slack_handle", "Unknown")
-    role     = profile.get("desired_role", "Unknown role")
-    location = profile.get("location", "Location unknown")
-
-    job_lines = []
-    for job in matched_jobs:
-        url   = job.get("url", "")
-        title = job.get("title", "")
-        co    = job.get("company", "")
-        loc   = job.get("location", "Remote")
-        link  = f"<{url}|{title}>" if url else title
-        job_lines.append(f"> • {link} at *{co}* — {loc}")
-
-    text = (
-        f":mailbox_with_mail: *Proposed DM* → {name}\n"
-        f"> *Role:* {role}\n"
-        f"> *Location:* {location}\n"
-        f"> *Matches:*\n" + "\n".join(job_lines)
-    )
-
-    r = requests.post(
-        "https://slack.com/api/chat.postMessage",
-        headers=SLACK_HEADERS,
-        json={"channel": ADMIN_CHANNEL_ID, "text": text},
-        timeout=10,
-    )
-    result = r.json()
-    if result.get("ok"):
-        log.info(f"Preview posted for {name}")
-    else:
-        log.warning(f"Preview post failed for {name}: {result.get('error')}")
-
-
-# ── 5. Send DM ────────────────────────────────────────────────────────────────
-
-def open_dm(user_id: str) -> str | None:
-    r = requests.post(
-        "https://slack.com/api/conversations.open",
-        headers=SLACK_HEADERS,
-        json={"users": user_id},
-        timeout=10,
-    )
-    data = r.json()
-    if data.get("ok"):
-        return data["channel"]["id"]
-    log.warning(f"Could not open DM with {user_id}: {data.get('error')}")
-    return None
-
-
-def send_dm(user_id: str, profile: dict, matched_jobs: list[dict]):
-    if not user_id:
-        log.warning(f"No user ID for {profile.get('slack_handle')} — skipping DM")
-        return
-
-    dm_channel = open_dm(user_id)
-    if not dm_channel:
-        return
-
-    name        = profile.get("slack_handle", "there").lstrip("@").split()[0]
-    role        = profile.get("desired_role", "your target role")
-    is_freeform = profile.get("freeform", False)
-
-    intro = (
-        f"👋 Hey {name}!\nI saw your post in #job-board — here are some roles this week that might be a great fit for you:"
-        if is_freeform else
-        f"👋 Hey {name}!\nBased on your profile as a *{role}*, we found some roles this week that might be a great fit for you:"
-    )
-
-    job_lines = []
-    for job in matched_jobs:
-        url   = job.get("url", "")
-        title = job.get("title", "")
-        co    = job.get("company", "")
-        loc   = job.get("location", "Remote")
-        link  = f"<{url}|{title}>" if url else title
-        job_lines.append(f"🔹 {link}\n*{co}* — {loc}")
-
-    footer = "✨ These companies are known to sponsor O-1 visas. Always verify sponsorship directly with the employer. Good luck! 🚀"
-
-    blocks = [
-        {"type": "section", "text": {"type": "mrkdwn", "text": intro}},
-        {"type": "divider"},
-        *[{"type": "section", "text": {"type": "mrkdwn", "text": line}} for line in job_lines],
-        {"type": "divider"},
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": footer}]},
-    ]
-
-    r = requests.post(
-        "https://slack.com/api/chat.postMessage",
-        headers=SLACK_HEADERS,
-        json={"channel": dm_channel, "blocks": blocks},
-        timeout=10,
-    )
-    if r.json().get("ok"):
-        log.info(f"DM sent to {profile.get('slack_handle')}")
-    else:
-        log.warning(f"DM failed for {profile.get('slack_handle')}: {r.json().get('error')}")
-
-
-# ── 6. Main entry point ───────────────────────────────────────────────────────
-
-def run_dm_flow(jobs: list[dict]):
-    log.info("Starting DM flow…")
-    profiles = fetch_profiles()
-
-    if not profiles:
-        log.info("No profiles found — skipping DMs.")
-        return
-
-    for profile in profiles:
+    raw = []
+    for scraper in [scrape_greenhouse, scrape_lever, scrape_linkedin]:
         try:
-            matched = match_jobs(profile, jobs)
-            if matched:
-                post_admin_preview(profile, matched)
-                if not DRY_RUN:
-                    send_dm(profile["user_id"], profile, matched)
-            else:
-                log.info(f"No matches for {profile.get('slack_handle')}")
+            results = scraper()
+            log.info(f"{scraper.__name__} → {len(results)} raw jobs")
+            raw += results
         except Exception as e:
-            log.error(f"DM flow failed for {profile.get('slack_handle')}: {e}")
+            log.error(f"{scraper.__name__} failed: {e}")
 
-    log.info("DM flow complete.")
+    log.info(f"Total raw listings: {len(raw)}")
+
+    # 1. Classify — target industries first, rest = "Other"
+    for j in raw:
+        j["industry"] = classify(j.get("title", ""))
+
+    # 2. Visa sponsorship filter
+    filtered = [j for j in raw if is_sponsored(j.get("company", ""), j.get("description", ""))]
+    log.info(f"After visa filter: {len(filtered)}")
+
+    # 3. US-only filter
+    filtered = [j for j in filtered if is_us(j)]
+    log.info(f"After US filter: {len(filtered)}")
+
+    # 4. Drop jobs with no valid direct URL
+    filtered = [j for j in filtered if j.get("url", "").startswith("http")]
+    log.info(f"After URL filter: {len(filtered)}")
+
+    # 5. Dedup against previously seen jobs
+    new_jobs = filter_new(filtered)
+    log.info(f"New this week: {len(new_jobs)}")
+
+    if not new_jobs:
+        log.info("No new jobs — skipping Slack post.")
+        return
+
+    # 6. Pick 15 diverse roles
+    diverse = diversify(new_jobs, target=15)
+    industries = set(j["industry"] for j in diverse)
+    log.info(f"Final selection: {len(diverse)} jobs across {len(industries)} industries: {industries}")
+
+    post_digest(diverse)
+    mark_seen(diverse)
+
+    # Send personalised DMs — pass full filtered list so Claude has more to match from
+    run_dm_flow(filtered)
+    log.info("Done.")
+
+
+if __name__ == "__main__":
+    run()
