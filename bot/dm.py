@@ -10,7 +10,6 @@ from bot.scrapers.linkedin import scrape_linkedin
 from bot.filters import is_sponsored
 from bot.deduper import filter_new, mark_seen
 from bot.slack import post_digest
-from bot.dm import run_dm_flow
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
