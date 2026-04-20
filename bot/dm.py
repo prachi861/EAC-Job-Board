@@ -5,6 +5,7 @@ scoring, and sends personalised 1-2 job recommendations via Slack DM.
 
 import os
 import re
+import time
 import logging
 import requests
 
@@ -227,6 +228,7 @@ def post_admin_preview(profile: dict, matched_jobs: list[dict]):
         log.info(f"Preview posted for {name}")
     else:
         log.warning(f"Preview post failed for {name}: {result.get('error')}")
+    time.sleep(1.2)  # stay under Slack's 1 msg/sec rate limit
 
 
 def open_dm(user_id: str) -> str | None:
